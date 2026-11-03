@@ -1,0 +1,6 @@
+# Optional OCR dependencies for scanned invoice PDFs.
+# Install these in addition to requirements.txt if you want scanned PDFs in
+# test_uploads_2/ to be parsed through the upload flow.
+easyocr==1.7.2
+Pillow>=10.0.0
+numpy>=1.26.0
