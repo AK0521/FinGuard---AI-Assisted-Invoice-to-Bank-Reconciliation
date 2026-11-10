@@ -79,8 +79,9 @@ def _load_json(text: str | None) -> dict[str, Any]:
 
 def extract_invoice_fields_with_ollama(text: str) -> dict[str, Any]:
     prompt = f"""
-You extract invoice fields for an accounting reconciliation prototype.
-Return strict JSON only. Do not guess missing values; use null.
+You extract invoice fields from source text for an accounts-payable review tool.
+Return one JSON object only. Copy only values explicitly supported by the text.
+Use null for missing or uncertain values. Never invent a PO, invoice number or amount.
 
 Fields:
 - vendor_name string or null
@@ -89,12 +90,19 @@ Fields:
 - total_amount decimal string or null
 - tax_amount decimal string or null
 - currency string, default INR only if the document implies rupees/INR
+- vendor_address, gstin, due_date, po_number: string or null
+- subtotal, taxable_amount, tax_rate: decimal string or null
+- tax_inclusive: boolean or null
+- line_items: array of objects with description, quantity, unit_price, line_total;
+  missing values within items must be null
 
 Invoice text:
 {text[:6000]}
 """
     data = _load_json(_generate(prompt, json_mode=True, timeout=30))
-    allowed = {"vendor_name", "invoice_number", "invoice_date", "total_amount", "tax_amount", "currency"}
+    allowed = {"vendor_name", "vendor_address", "gstin", "invoice_number", "invoice_date",
+               "due_date", "po_number", "subtotal", "taxable_amount", "tax_amount",
+               "tax_rate", "total_amount", "tax_inclusive", "line_items", "currency"}
     return {key: data.get(key) for key in allowed if key in data}
 
 

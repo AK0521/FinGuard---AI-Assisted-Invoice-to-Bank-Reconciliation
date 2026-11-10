@@ -1,78 +1,19 @@
-# FinGuard
+# FinGuard — Invoice Lifecycle Workspace
 
-FinGuard is a local, human-in-the-loop prototype for reconciling vendor invoice PDFs against outgoing bank statement transactions. It is designed for small-business finance operators, bookkeepers, accountants, and evaluators who need to see which invoices are paid, partially paid, unpaid, ambiguous, or unmatched against bank activity.
+FinGuard is a runnable local prototype for an Accounts Payable (AP) analyst at a mid-sized company. It connects two different finance questions:
 
-The project intentionally keeps the core reconciliation deterministic and reviewable. Local AI is used only for bounded assistance: extracting missing fields from already-extracted invoice text and rewriting cited evidence answers when Ollama is available.
+1. **Invoice approval:** Should this invoice be approved for payment? The app extracts a PDF, verifies the vendor and purchase order (PO), checks balances, tax, line items and duplicates, then suggests **Approved**, **Needs review** or **Rejected**.
+2. **Payment reconciliation:** Was the invoice actually paid? The existing workflow matches bank CSV transactions to the same invoice records and tracks **Paid**, **Partial**, **Unpaid**, **Needs review** and **Unmatched bank** outcomes.
 
-## What It Does
+Approval never means paid. A matching bank transaction never automatically approves an invoice. Analysts can inspect the source, correct extraction errors, record a final approval decision, and separately review payment matches.
 
-- Loads a bundled sample evaluation workspace on first backend startup.
-- Accepts invoice PDFs and one or more bank CSV statements.
-- Extracts text from normal PDFs with PyMuPDF.
-- Optionally runs OCR on scanned PDFs when EasyOCR is installed.
-- Uses local Ollama SLM extraction for unusual invoice text layouts when available.
-- Reconciles invoices to bank transactions using invoice references, vendor tokens, date windows, and amounts.
-- Classifies records as Paid, Partial, Unpaid, Needs review, or Unmatched bank.
-- Shows evidence detail with invoice data, bank candidates, flags, and natural-language reasons.
-- Lets a human approve, reject, correct matches, edit paid amount, and preserve an audit trail.
-- Provides cited Evidence Q&A using local retrieval, with optional Ollama-assisted wording.
-- Exports a CSV report with suggested status, final status, amounts, evidence, and review notes.
+This is an evaluation prototype, not an ERP, payment system or production accounting control.
 
-## Repository Layout
+## Quick start (Windows PowerShell)
 
-```text
-backend/              FastAPI API, parsing, reconciliation, retrieval, tests
-frontend/             React/Vite/Tailwind analyst workspace
-scripts/              Local scripts to regenerate sample upload packs
-test_uploads_2/       Submission sample PDFs and bank CSVs for evaluator verification
-ARCHITECTURE.md       System design and architecture diagram
-SUBMISSION_BRIEF.md   Written brief material for the assignment
-EVALUATION.md         Test and verification notes
-AI_USAGE.md           Notes on local AI boundaries
-```
+Prerequisites: Python 3.11/3.12, Node.js 20.19+ (20.x) or 22.12+, npm. Open **two terminals at the repository root**.
 
-## Architecture And Stack
-
-- Frontend: React, TypeScript, Vite, Tailwind CSS, lucide-react icons.
-- Backend: FastAPI, Pydantic, Python standard CSV utilities.
-- Persistence: SQLite local database created at `data/finguard.sqlite3` by default.
-- PDF extraction: PyMuPDF.
-- Optional OCR: EasyOCR.
-- Optional local SLM: Ollama with `qwen2.5-coder:1.5b`.
-- Tests: pytest.
-
-High-level flow:
-
-```text
-Human analyst
-  -> React workspace
-  -> FastAPI backend
-  -> PDF/CSV ingestion
-  -> PyMuPDF text extraction or optional EasyOCR
-  -> parser plus optional local Ollama field extraction
-  -> SQLite records
-  -> deterministic reconciliation engine
-  -> evidence index and cited Q&A
-  -> human review decision and CSV export
-```
-
-See `ARCHITECTURE.md` for the full diagram and AI/human responsibility boundary.
-
-## Prerequisites
-
-- Python 3.11+ or 3.12
-- Node.js 20+ recommended
-- npm
-- Optional: Ollama running locally with `qwen2.5-coder:1.5b`
-- Optional: EasyOCR dependencies for scanned PDF OCR
-
-No cloud LLM API key is required.
-
-## Quick Start: Run The App
-
-From a fresh clone, open two terminals from the repository root.
-
-Terminal 1 - backend API:
+**Terminal 1 — backend**
 
 ```powershell
 cd backend
@@ -83,116 +24,95 @@ python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Terminal 2 - frontend UI:
+**Terminal 2 — frontend**
 
 ```powershell
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Then open the Vite URL shown in Terminal 2, usually:
+Open **http://127.0.0.1:5173**. The API health check is **http://127.0.0.1:8000/api/health**.
 
-```text
-http://127.0.0.1:5173
-```
+On first start with an empty SQLite database, FinGuard processes **three** sample PDFs through the real pipeline: `01_metro_clean.pdf`, `02_kaveri_tax_discrepancy.pdf` and `04_blue_lotus_split_one.pdf`. It imports the vendor master and PO register, but **does not import the bank CSV**. The Overview should show three processed invoices and no bank payments. Existing local databases retain their contents until you click **Reload demo workspace**.
 
-On first backend startup, FinGuard automatically loads the included sample evaluation workspace, so the workspace should already show records without requiring evaluator uploads.
+If PowerShell blocks activation, use `backend\.venv\Scripts\python.exe` in place of `python` for the backend commands.
 
-## Fresh Clone Setup
+### macOS/Linux
 
-From the repository root:
+Use `source .venv/bin/activate` in the backend terminal. The other commands are the same.
 
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
+## The main workflow
 
-Optional OCR support for scanned PDFs:
+1. Open **Overview** to see approval and payment metrics derived from SQLite. Use **Sample documents** to see which included files are processed and which remain available.
+2. Open **Invoice approval**. Upload one or more of the waiting PDFs; each gets a real processing run.
+3. Open the **Live processing** view to see backend stage events: ingestion, text/OCR, field extraction, validation, vendor, PO, duplicate, financial checks, decision and persistence.
+4. Open any **Invoice review** record to inspect the original PDF, extracted fields and page references, PO, checks, machine suggestion, linked payment state and audit trail.
+5. Correct an extracted value or choose another PO, add a note, then save a human approval or rejection. The original extraction and suggested decision remain visible.
+6. Open **Payment reconciliation** to import bank CSVs, inspect payment evidence, correct matches and edit the paid amount. Existing reconciliation data and Evidence Q&A remain available.
+7. Open **Processing history** and **Reports** to inspect runs and export approval and payment CSVs.
 
-```powershell
-python -m pip install -r requirements-ocr.txt
-```
+Invoice uploads and bank CSV uploads **add to the local workspace**. The same bank CSV bytes are skipped if already imported, so a repeated selection does not double-count payments. **Reload demo workspace** is an explicit reset: it clears local reviews and imports, reprocesses the three opening invoices, and leaves the other PDFs and bank CSV ready for another live run.
 
-In a second terminal, install frontend dependencies:
+## Demo data and a five-minute walkthrough
 
-```powershell
-cd frontend
-npm install
-```
+The included files live in [sample_data](sample_data):
 
-## Run Locally
+- `vendors.csv`: seven fictional vendor records, including unapproved and inactive vendors.
+- `purchase_orders.csv`: eight POs with statuses, line items, tax rates and tolerances.
+- Eight numbered invoice PDFs in distinct layouts, including one image-only scan. Only files **01**, **02** and **04** are preloaded.
+- `bank_statement.csv`: five full, partial and unmatched outgoing bank transactions; it is never preloaded.
+- `live_upload/09_blue_lotus_live_upload.pdf`: another clean invoice on a separate PO, also available for live upload.
+- `demo_manifest.json`: the opening selection and scenario descriptions used by the in-app Sample documents guide.
 
-Start the backend:
+The sample documents are generated by [scripts/generate_approval_demo.py](scripts/generate_approval_demo.py) with PyMuPDF and Pillow. The included generated files are sufficient to run the demo; regeneration is optional.
 
-```powershell
-cd backend
-.\.venv\Scripts\Activate.ps1
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
+Suggested recording sequence:
 
-Start the frontend in another terminal:
+1. Click **Reload demo workspace** if this database was used before. Overview should show three invoices; inspect preloaded **01** (clean) and **02** (tax exception).
+2. Open **Sample documents** from Overview or Invoice approval. The guide reads the included files and current database state.
+3. On Invoice approval, upload **03_pixelcraft_bundled.pdf** to show a fresh clean run and its ten persisted stages.
+4. Upload **05_blue_lotus_split_two.pdf**, then **06_blue_lotus_over_balance.pdf**. Together with preloaded **04**, they show a valid second invoice and a later INR 4,000 PO-balance excess.
+5. On Payment reconciliation, upload **bank_statement.csv**. Show full Metro and Blue Lotus payments, partial Kaveri and Blue Lotus payments, unpaid records, and the unmatched card purchase. Re-uploading the same CSV is safely skipped.
+6. Back on Invoice approval, upload **07_metro_duplicate.pdf** to show a confirmed duplicate against preloaded **01**. The payment matcher may then require review for the two Metro records sharing an invoice number.
+7. Upload **08_cedar_scanned_missing_number.pdf** for the OCR/fallback and missing-number review case. Optionally upload **live_upload/09_blue_lotus_live_upload.pdf** for another clean invoice on a separate PO.
+8. Save a human review note/decision, then show Processing history and Reports. Reload demo to restore the same three-invoice, no-bank opening state.
 
-```powershell
-cd frontend
-npm run dev
-```
+**Important:** re-uploading **01**, **02** or **04** is intentionally flagged as a repeated document. Files **03**, **05–09** are available for a fresh live run after reset.
 
-Open the Vite URL shown in the terminal, usually:
+The older [test_uploads_2](test_uploads_2) pack remains for checking the original payment-reconciliation import separately. Those PDFs do not necessarily carry PO references, so they may need approval review.
 
-```text
-http://127.0.0.1:5173
-```
+## Optional local AI and OCR
 
-When the backend database is empty, FinGuard automatically seeds the bundled sample evaluation workspace. The UI should therefore show records immediately after a fresh run.
+The app runs without Ollama or EasyOCR. It never labels a fallback as AI extraction.
 
-## Sample Workspace And Test Uploads
+- **Ollama:** If `qwen2.5-coder:1.5b` is installed and the Ollama service is running, irregular invoice text can use the local model to fill missing structured fields. Such a case is marked for source review. Evidence Q&A can also use the model to rewrite cited answers. The model does **not** calculate money or decide approval or payment status.
+- **OCR:** Install optional dependencies with `python -m pip install -r requirements-ocr.txt` from `backend`. EasyOCR model weights must also be present locally; the app will not silently download them during processing. Without a working local OCR model, an image-only PDF becomes a visible Needs review case with extraction warnings.
 
-The app includes a sample evaluation workspace in backend seed data. To reset the UI back to that included workspace, click **Reload sample** in the left overview panel or call:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/demo
-```
-
-The matching sample files are included in `test_uploads_2/`:
-
-- `01_metro_facility_services.pdf`
-- `02_kaveri_paper_mart.pdf`
-- `03_pixelcraft_design_studio.pdf`
-- `04_blue_lotus_packaging_unstructured.pdf`
-- `05_cedar_cleaning_care_scanned.pdf`
-- `bank_statement_january.csv`
-- `bank_statement_february.csv`
-
-To reproduce the sample through the upload flow, upload all five PDFs as invoice PDFs and both CSV files as bank CSVs. The scanned Cedar invoice requires optional EasyOCR support to parse from the upload path; the default seeded workspace already contains the expected extracted record for evaluator convenience.
-
-Expected sample status mix:
-
-- 2 Paid invoices
-- 1 Partial invoice
-- 1 Unpaid invoice
-- 1 Needs review invoice
-- 1 Unmatched bank transaction
-
-## Optional Ollama Setup
-
-FinGuard works without Ollama. With Ollama available, Evidence Q&A returns `answer_mode: ollama_rag`, and unstructured invoice text can be converted into structured invoice fields.
-
-Example:
+Optional Ollama setup after installing Ollama:
 
 ```powershell
 ollama pull qwen2.5-coder:1.5b
 ollama serve
 ```
 
-Optional environment variables are listed in `.env.example`.
+Use a separate terminal for `ollama serve`. See [.env.example](.env.example) for optional configuration names; the app reads environment variables directly and does not require a `.env` file. `FINGUARD_DISABLE_OLLAMA=1` disables model calls.
 
-## Run Tests
+## Architecture and stack
 
-Backend tests:
+- **Frontend:** React, TypeScript, Vite, Tailwind CSS, lucide-react.
+- **API:** FastAPI, Pydantic.
+- **Persistence:** SQLite in ignored `data/finguard.sqlite3` by default. Original uploaded PDF bytes, document fingerprints, extracted fields, stage events, suggestions, analyst decisions and payment records are stored locally.
+- **PDF:** PyMuPDF text extraction; optional EasyOCR for image-only PDFs.
+- **AI:** Optional local Ollama SLM for bounded extraction and cited answer wording. Regex and schema validation provide the fallback for supported documents.
+- **Business rules:** Pure Python with `Decimal` for approval, PO balance/tolerance and bank matching. AI does not make the final suggested decision.
+- **Jobs:** FastAPI background tasks with lightweight polling for the live run view.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the system diagram and decision boundaries, [DEMO_GUIDE.md](DEMO_GUIDE.md) for the presentation sequence, and [AI_USAGE.md](AI_USAGE.md) for the exact AI role.
+
+## Tests and build
+
+From the repository root:
 
 ```powershell
 cd backend
@@ -201,27 +121,23 @@ $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 python -m pytest -q -p no:cacheprovider
 ```
 
-Frontend production build:
+In a second terminal:
 
 ```powershell
 cd frontend
+npm ci
 npm run build
 ```
 
-## Known Limitations
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD` prevents unrelated globally installed pytest plugins from altering the run. The test suite covers deterministic approval rules, PDF parsing, API upload and stage persistence, review/audit persistence, CSV import/export, payment matching and Q&A citations.
 
-- This is a local prototype, not production accounting software.
-- There is one active local workspace; uploading files replaces the current workspace.
-- No authentication or multi-user workspace isolation is implemented.
-- Bank upload supports CSV, not scanned bank statement PDFs.
-- OCR quality depends on the local EasyOCR installation and scan quality.
-- Very unusual invoice layouts may need parser or SLM prompt additions.
-- Matching is conservative and can require human review for ambiguous candidates.
-- The app does not make payments, file taxes, validate GST compliance, or provide legal, tax, GST, or banking advice.
+## Known limitations
 
-## Submission Notes
-
-- Local database files are ignored by git.
-- Sample verification files are intentionally included in `test_uploads_2/`.
-- Build outputs and dependency folders are ignored.
-- Keep secrets in local environment variables; do not commit `.env` files.
+- This is a **single-user local prototype**. It has no login, JWT auth, role permissions or tenant isolation. Do not expose the API publicly or upload confidential production invoices.
+- OCR depends on separately installed EasyOCR and local model weights; scan quality varies. OCR failures and missing fields go to review.
+- Irregular layouts may require Ollama or additional parser rules. The fallback is strongest on the bundled layouts and clearly flags missing fields.
+- Vendor name matching is conservative. Approximate or ambiguous matches need a human. This prototype does not verify real GST registrations or consult a live ERP.
+- PO policy and tax checks are simplified synthetic controls, not legal, tax or payment advice. Bundled or unmatched line items go to review.
+- Background tasks and polling are suitable for a local demo. There is no durable worker queue, resumable job processing or multi-user concurrency control.
+- SQLite and original documents stay on the local machine. There is no cloud sync or production backup strategy.
+- The older payment parser supports common outgoing-bank CSV column names; arbitrary bank formats may need mapping.

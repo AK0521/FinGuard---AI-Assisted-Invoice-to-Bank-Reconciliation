@@ -6,6 +6,7 @@ import fitz
 from fastapi.testclient import TestClient
 
 from app.database import add_review_decision, init_db, latest_reviews_by_result, reset_workspace
+from app.demo_data import SAMPLES
 from app.main import app
 from app.parsing import parse_bank_csv, parse_invoice_pdf
 
@@ -42,6 +43,16 @@ def test_pdf_extraction_text_based_invoice() -> None:
     assert report.invoices[0].page_number == 1
 
 
+def test_sentence_layout_does_not_swallow_vendor_fields() -> None:
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Asha Office Supplies issued bill INV-777 on 2026-04-08. Purchase order PO-100.")
+    report = parse_invoice_pdf(doc.tobytes(), "irregular.pdf", "src_1")
+    doc.close()
+    assert report.invoices[0].vendor_name == "Asha Office Supplies"
+    assert report.invoices[0].invoice_date is None  # The model stage may fill this later.
+
+
 def test_pdf_extraction_reports_scanned_or_empty_pdf() -> None:
     doc = fitz.open()
     doc.new_page()
@@ -54,8 +65,12 @@ def test_review_decision_persistence(monkeypatch, tmp_path) -> None:
     setup_temp_db(monkeypatch, tmp_path)
     with TestClient(app) as client:
         client.post("/api/demo")
+        bank = SAMPLES / "bank_statement.csv"
+        upload = client.post("/api/upload", files={"bank_csv": (bank.name, bank.read_bytes(), "text/csv")})
+        assert upload.json()["bank_transactions"] == 5
         results = client.get("/api/reconciliations").json()["results"]
-    review_target = next(result for result in results if result["outcome"] == "needs_review")
+    review_target = next(result for result in results if result.get("invoice_number") == "KPM-331")
+    assert review_target["outcome"] == "partially_paid"
     add_review_decision(review_target["id"], "reject", "unpaid", [], "Reviewed in test")
     latest = latest_reviews_by_result()
     assert latest[review_target["id"]]["final_status"] == "unpaid"
@@ -66,6 +81,11 @@ def test_cited_qa_uses_source_references(monkeypatch, tmp_path) -> None:
     setup_temp_db(monkeypatch, tmp_path)
     with TestClient(app) as client:
         client.post("/api/demo")
+        empty = client.post("/api/ask", json={"question": "Which bank transactions have no matching invoice?"}).json()
+        assert "No unmatched outgoing bank transactions" in empty["answer"]
+        bank = SAMPLES / "bank_statement.csv"
+        upload = client.post("/api/upload", files={"bank_csv": (bank.name, bank.read_bytes(), "text/csv")})
+        assert upload.json()["bank_transactions"] == 5
         response = client.post("/api/ask", json={"question": "Which bank transactions have no matching invoice?"})
     data = response.json()
     assert "Unmatched outgoing bank transactions" in data["answer"]

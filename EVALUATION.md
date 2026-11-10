@@ -1,59 +1,45 @@
-# Evaluation
+# Evaluation — 10 November 2026
 
-Command run:
+## Automated checks actually run
+
+From `backend`:
 
 ```powershell
-cd backend
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 python -m pytest -q -p no:cacheprovider
 ```
 
-Actual result: `16 passed, 14 warnings in 16.66s`.
+Result after the recording-mode changes: **43 passed, 14 warnings in 192.04 seconds**. The warnings were Pydantic/FastAPI and EasyOCR/Torch deprecations; there were no failed assertions. The suite ran alongside local UI services, which made it slower than the earlier isolated run. The pytest cache provider was disabled because it previously hung at shutdown in this Windows environment.
 
-Warnings were from Pydantic `json_encoders`, FastAPI `on_event`, and EasyOCR/Torch deprecations. The pytest cache provider was disabled because it hung at process shutdown in this environment after all assertions completed.
-
-The default sample workspace is loaded automatically when the local database is empty. Matching verifier files are in `test_uploads_2/`.
-
-Frontend production build command:
+From `frontend`:
 
 ```powershell
-cd frontend
 npm run build
 ```
 
-Actual result: passed. The first build attempt hit a Windows `EPERM` lock while clearing the ignored `frontend/dist/assets` folder; rerunning the same command with filesystem permission completed successfully.
+Result after the final Sample documents UI edit: **passed**. TypeScript checked without errors; Vite built 1,582 modules in 14.12 seconds. On this machine the ignored `dist` directory required permission to replace because of a Windows file lock.
 
-## Reconciliation Cases
+`git diff --check` exited successfully. A repository text scan found no hardcoded credentials, API keys or machine-specific Windows paths. The local SQLite workspace and build outputs are ignored by Git.
 
-| Case | Expected behavior | Actual result |
-| --- | --- | --- |
-| Exact match | Invoice paid when reference, date, and amount match | Passed |
-| Partial payment | Invoice marked partially paid with outstanding balance | Passed |
-| Unpaid invoice | Invoice marked unpaid when no candidate exists | Passed |
-| Unmatched bank transaction | Outgoing bank transaction gets unmatched-bank result | Passed |
-| Duplicate invoice candidate | Duplicate invoice number and amount require review | Passed |
-| Vendor-name variation | Vendor token match can reconcile without exact vendor spelling | Passed |
-| Transaction outside allowed date window | Late transaction ignored and invoice remains unpaid | Passed |
-| Amount mismatch | Near amount mismatch requires review | Passed |
-| Missing invoice number | Match candidate exists but invoice requires review | Passed |
-| Ambiguous candidate match | Multiple exact candidates require review | Passed |
+## Functional cases covered by the suite
 
-## Additional Tests
+- Exact, within-tolerance and over-tolerance invoice-to-PO decisions.
+- Unapproved vendor, closed PO, missing or ambiguous PO, duplicate invoice and repeated source PDF.
+- Valid split invoices, cumulative PO balance and over-consumption.
+- Tax mismatch, missing invoice number, invalid date/amount, mismatched line descriptions, negative values and itemized line totals.
+- Fresh startup processing only the three selected PDFs, with seven vendors, eight POs, zero bank transactions and matching dashboard counts.
+- Live upload of all remaining sample PDFs, including the valid second split invoice, PO over-balance case, confirmed duplicate, image-only OCR/fallback case and held-out clean invoice.
+- Live import of the bank CSV after the relevant invoices, full/partial/unmatched payment outcomes, linked payment detail without changing approval, and exact-file duplicate import prevention.
+- Two consecutive demo resets restoring the same three invoices and clearing later uploads, bank rows and human approval reviews.
+- Upload API, failed malformed PDF, OCR-unavailable review case, ten persisted stage events, source PDF and preview retrieval, human approval audit, CSV import and export.
+- Payment exact/partial/unpaid/unmatched cases, date/amount ambiguity, citation references, payment review persistence and prevention of cross-invoice double counting.
 
-| Area | Expected behavior | Actual result |
-| --- | --- | --- |
-| CSV parsing | Common bank CSV headers produce transaction records and row references | Passed |
-| PDF extraction | Text-based PDF fields are extracted | Passed |
-| Scanned/empty PDF handling | Local OCR is attempted; unreadable files return a clear message | Passed |
-| Review persistence | Review decision is stored separately from suggestion | Passed |
-| Citation/source references | Q&A answer includes source citations with row/page locators | Passed |
-| CSV export | Report includes suggestions, final status, and evidence fields | Passed |
+## Local application smoke check
 
-## Known Failure Modes
+With a fresh local SQLite database, the browser displayed **three** opening invoices: two Approved and one Needs review. The in-app Sample documents guide showed those three as processed and the other PDFs and bank CSV as waiting. The browser's Payment reconciliation file picker imported `bank_statement.csv`; the page then showed two Paid invoices, one Partial invoice and an unmatched bank record. Selecting the same CSV again produced “already imported; duplicate CSV skipped” and did not change those counts. Overview refreshed its outstanding amount. Clicking Reload demo workspace displayed a confirmation and restored the original three unpaid invoices; the guide again showed the bank file as waiting. In an earlier isolated smoke check, the held-out `09` PDF also completed ten stages and rendered its source preview.
 
-- Low-quality scanned PDFs depend on local OCR quality.
-- Very unusual invoice layouts may need parser or SLM prompt additions.
-- Bank CSVs with uncommon localized headers may need mapper additions.
-- Vendor token matching can miss abbreviations not present in the source text.
-- The prototype does not attempt tax/GST validation.
+The recording-mode browser check used `FINGUARD_DISABLE_OLLAMA=1` to verify the fallback path. Separately, the local Ollama service previously reported `qwen2.5-coder:1.5b` available. A real irregular-PDF upload went through the API pipeline and stored `text+ollama` extraction, correctly separated the vendor name from the surrounding sentence, filled the missing date and total, and returned Needs review with `model_extraction_review`. Evidence Q&A returned `answer_mode=ollama_rag` with a cited bank answer. The automated approval rules do not depend on the model.
 
+## Verification boundary
+
+These checks ran on the current local checkout with installed dependencies. They do not prove all third-party invoice layouts, bank CSV schemas, low-quality scans or operating systems will work unchanged. OCR requires locally available EasyOCR model weights. This single-user prototype has no authentication, durable job queue, production policy source or real payment execution.

@@ -143,6 +143,10 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 
 def reset_workspace() -> None:
     with connect() as conn:
+        existing = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in ("approval_reviews", "approvals", "approval_events", "approval_runs", "purchase_orders", "vendors"):
+            if table in existing:
+                conn.execute(f"DELETE FROM {table}")
         for table in [
             "evidence_index",
             "review_decisions",
@@ -288,8 +292,11 @@ def fetch_bank_transactions() -> list[BankTransactionRecord]:
 
 def replace_reconciliation_results(results: list[ReconciliationSuggestion]) -> None:
     with connect() as conn:
-        conn.execute("DELETE FROM review_decisions")
-        conn.execute("DELETE FROM reconciliation_results")
+        # Stable result IDs let recalculation keep analyst decisions for existing invoices.
+        current_ids = {result.id for result in results}
+        for row in conn.execute("SELECT id FROM reconciliation_results").fetchall():
+            if row["id"] not in current_ids:
+                conn.execute("DELETE FROM reconciliation_results WHERE id = ?", (row["id"],))
         conn.executemany(
             """
             INSERT INTO reconciliation_results (
@@ -297,6 +304,14 @@ def replace_reconciliation_results(results: list[ReconciliationSuggestion]) -> N
                 candidate_transaction_ids_json, selected_transaction_ids_json, reason_codes_json,
                 reason_text, confidence, needs_review, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                outcome=excluded.outcome, matched_amount=excluded.matched_amount,
+                outstanding_amount=excluded.outstanding_amount,
+                candidate_transaction_ids_json=excluded.candidate_transaction_ids_json,
+                selected_transaction_ids_json=excluded.selected_transaction_ids_json,
+                reason_codes_json=excluded.reason_codes_json,
+                reason_text=excluded.reason_text, confidence=excluded.confidence,
+                needs_review=excluded.needs_review
             """,
             [
                 (

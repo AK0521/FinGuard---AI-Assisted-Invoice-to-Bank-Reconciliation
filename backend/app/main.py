@@ -1,41 +1,49 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
-from decimal import Decimal
+import fitz
+from pathlib import Path
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .database import (
     add_review_decision,
     connect,
-    create_source_file,
-    fetch_bank_transactions,
     fetch_invoices,
     init_db,
     insert_bank_transactions,
-    insert_invoices,
     json_load,
     latest_reviews_by_result,
     reset_workspace,
     row_to_dict,
     run_reconciliation_and_store,
 )
-from .demo_data import seed_demo_workspace, seed_sample_workspace_if_empty
+from .approval import InvoiceFields, evaluate_invoice
+from .approval_pipeline import import_procurement, process_pdf
+from .approval_store import (
+    add_approval_review, approval_detail, approval_rows, create_run, init_approval_db,
+    previous_invoices, purchase_orders, run_detail, runs, save_source, set_source_status,
+    source_document, vendors,
+)
+from .demo_data import sample_catalog, seed_demo_workspace, seed_sample_workspace_if_empty
 from .llm import ollama_status
 from .normalization import as_money
-from .parsing import parse_bank_csv, parse_invoice_pdf
+from .parsing import parse_bank_csv
 from .retrieval import answer_question
 
 
 app = FastAPI(title="FinGuard API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173",
+                   "http://localhost:5174", "http://127.0.0.1:5174"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,9 +64,17 @@ class AskRequest(BaseModel):
     result_id: str | None = None
 
 
+class ApprovalReviewRequest(BaseModel):
+    action: Literal["approve", "reject"]
+    corrections: dict[str, object] = Field(default_factory=dict)
+    selected_po: str | None = None
+    note: str = ""
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    init_approval_db()
     seed_sample_workspace_if_empty()
 
 
@@ -79,6 +95,13 @@ def load_demo() -> dict[str, int | str]:
     return seed_demo_workspace()
 
 
+@app.get("/api/demo/catalog")
+def demo_catalog() -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    return sample_catalog()
+
+
 @app.post("/api/reset")
 def reset() -> dict[str, str]:
     init_db()
@@ -92,35 +115,56 @@ async def upload_workspace(
     bank_csv: list[UploadFile] = File(default=[]),
 ) -> dict[str, object]:
     init_db()
-    reset_workspace()
-    parsed_invoices = []
+    init_approval_db()
     parsed_transactions = []
-    messages: list[str] = ["Uploaded files replace the current local workspace."]
+    messages: list[str] = []
+    processed_invoices = 0
+    seen_bank_hashes: set[str] = set()
 
     for invoice_file in invoices:
         contents = await invoice_file.read()
-        source_id = create_source_file(invoice_file.filename or "invoice.pdf", "invoice_pdf", "uploaded")
-        report = parse_invoice_pdf(contents, invoice_file.filename or "invoice.pdf", source_id)
-        parsed_invoices.extend(report.invoices)
-        messages.extend(report.messages)
+        filename = Path(invoice_file.filename or "invoice.pdf").name
+        run_id = create_run(filename)
+        process_pdf(run_id, filename, contents)
+        run = run_detail(run_id)
+        if run and run["status"] == "completed":
+            processed_invoices += 1
+        else:
+            messages.append(f"{filename}: {run['error'] if run else 'processing failed'}")
 
     for bank_file in bank_csv:
         contents = await bank_file.read()
-        source_id = create_source_file(bank_file.filename or "bank.csv", "bank_csv", "uploaded")
-        report = parse_bank_csv(contents, bank_file.filename or "bank.csv", source_id)
+        filename = Path(bank_file.filename or "bank.csv").name
+        if not filename.lower().endswith(".csv") or len(contents) > 8 * 1024 * 1024:
+            messages.append(f"{filename}: expected a CSV no larger than 8 MB.")
+            continue
+        sha = hashlib.sha256(contents).hexdigest()
+        with connect() as conn:
+            already_imported = conn.execute("""
+                SELECT 1 FROM source_files sf
+                JOIN bank_transactions bt ON bt.source_file_id = sf.id
+                WHERE sf.source_type = 'bank_csv' AND sf.sha256 = ?
+                  AND sf.status = 'processed' LIMIT 1
+            """, (sha,)).fetchone()
+        if already_imported or sha in seen_bank_hashes:
+            messages.append(f"{filename}: already imported; duplicate CSV skipped.")
+            continue
+        source_id, _ = save_source(filename, contents, "bank_csv")
+        report = parse_bank_csv(contents, filename, source_id)
         parsed_transactions.extend(report.transactions)
         messages.extend(report.messages)
+        set_source_status(source_id, "processed" if report.transactions else "failed", " ".join(report.messages))
+        if report.transactions:
+            seen_bank_hashes.add(sha)
 
-    if parsed_invoices:
-        insert_invoices(parsed_invoices)
     if parsed_transactions:
         insert_bank_transactions(parsed_transactions)
     results = run_reconciliation_and_store()
 
     return {
-        "message": "Upload processed.",
+        "message": "Files added to the current workspace." if processed_invoices or parsed_transactions else "No new files imported.",
         "messages": messages,
-        "invoices": len(parsed_invoices),
+        "invoices": processed_invoices,
         "bank_transactions": len(parsed_transactions),
         "reconciliation_results": len(results),
     }
@@ -445,4 +489,246 @@ def export_csv() -> StreamingResponse:
     buffer.seek(0)
     headers = {"Content-Disposition": 'attachment; filename="finguard-reconciliation-report.csv"'}
     return StreamingResponse(iter([buffer.getvalue()]), media_type="text/csv", headers=headers)
+
+
+@app.get("/api/approval/summary")
+def approval_summary() -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    rows = approval_rows()
+    counts = {status: sum(row["final_status"] == status for row in rows)
+              for status in ("approved", "needs_review", "rejected")}
+    total = sum((Decimal(row["total_amount"] or "0") for row in rows), Decimal("0"))
+    awaiting = sum((Decimal(row["total_amount"] or "0") for row in rows
+                    if row["final_status"] == "needs_review"), Decimal("0"))
+    return {
+        "total_invoices": len(rows), "status_breakdown": counts,
+        "total_value": as_money(total), "awaiting_review_value": as_money(awaiting),
+        "recent_runs": runs()[:6],
+    }
+
+
+@app.get("/api/approval/vendors")
+def approval_vendors() -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    return {"vendors": [item.model_dump(mode="json") for item in vendors()]}
+
+
+@app.get("/api/approval/purchase-orders")
+def approval_pos() -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    prior = approval_rows()
+    orders = []
+    for po in purchase_orders():
+        data = po.model_dump(mode="json")
+        consumed = po.opening_invoiced_amount + sum(
+            (Decimal(row["total_amount"] or "0") for row in prior
+             if row["matched_po"] == po.number and row["final_status"] == "approved"),
+            Decimal("0"),
+        )
+        data["remaining_balance"] = as_money(po.approved_amount - consumed)
+        orders.append(data)
+    return {"purchase_orders": orders}
+
+
+@app.post("/api/approval/procurement")
+async def upload_procurement(
+    vendor_csv: UploadFile | None = File(default=None),
+    po_csv: UploadFile | None = File(default=None),
+) -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    if not vendor_csv and not po_csv:
+        raise HTTPException(status_code=400, detail="Upload a vendor master or PO register CSV.")
+    for file in (vendor_csv, po_csv):
+        if file and (not (file.filename or "").lower().endswith(".csv")):
+            raise HTTPException(status_code=400, detail="Procurement files must be CSV.")
+    vendor_bytes = await vendor_csv.read() if vendor_csv else None
+    po_bytes = await po_csv.read() if po_csv else None
+    if any(len(data) > 4 * 1024 * 1024 for data in (vendor_bytes, po_bytes) if data):
+        raise HTTPException(status_code=413, detail="Each procurement CSV must be under 4 MB.")
+    try:
+        return import_procurement(vendor_bytes, po_bytes)
+    except (ValueError, TypeError, InvalidOperation, csv.Error) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/approval/process")
+async def start_approval_process(
+    background_tasks: BackgroundTasks,
+    invoices: list[UploadFile] = File(default=[]),
+) -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    if not invoices:
+        raise HTTPException(status_code=400, detail="Select at least one invoice PDF.")
+    scheduled = []
+    for file in invoices:
+        filename = Path(file.filename or "invoice.pdf").name
+        contents = await file.read()
+        if not filename.lower().endswith(".pdf") or len(contents) > 12 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"{filename}: expected a PDF no larger than 12 MB.")
+        run_id = create_run(filename)
+        background_tasks.add_task(process_pdf, run_id, filename, contents)
+        scheduled.append({"run_id": run_id, "filename": filename})
+    return {"runs": scheduled}
+
+
+@app.get("/api/approval/runs")
+def approval_runs() -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    return {"runs": runs()}
+
+
+@app.get("/api/approval/runs/{run_id}")
+def approval_run_detail(run_id: str) -> dict:
+    init_db()
+    init_approval_db()
+    result = run_detail(run_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Processing run not found.")
+    return result
+
+
+@app.get("/api/approval/invoices")
+def approval_invoices(search: str = "", status: str = "all") -> dict[str, object]:
+    init_db()
+    init_approval_db()
+    rows = approval_rows()
+    if status != "all":
+        rows = [row for row in rows if row["final_status"] == status]
+    query = search.strip().lower()
+    if query:
+        rows = [row for row in rows if query in " ".join(str(row.get(key) or "")
+                for key in ("vendor_name", "invoice_number", "matched_po", "original_filename")).lower()]
+    return {"invoices": rows}
+
+
+@app.get("/api/approval/invoices/{invoice_id}")
+def approval_invoice_detail(invoice_id: str) -> dict:
+    init_db()
+    init_approval_db()
+    result = approval_detail(invoice_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Approval invoice not found.")
+    return result
+
+
+@app.post("/api/approval/invoices/{invoice_id}/review")
+def review_approval_invoice(invoice_id: str, payload: ApprovalReviewRequest) -> dict[str, str]:
+    init_db()
+    init_approval_db()
+    result = approval_detail(invoice_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Approval invoice not found.")
+    allowed = {"vendor_name", "gstin", "invoice_number", "invoice_date", "due_date",
+               "po_number", "currency", "subtotal", "taxable_amount", "tax_amount",
+               "tax_rate", "total_amount", "tax_inclusive", "line_items"}
+    if set(payload.corrections) - allowed:
+        raise HTTPException(status_code=400, detail="Unsupported corrected field.")
+    if payload.selected_po and payload.selected_po not in {po.number for po in purchase_orders()}:
+        raise HTTPException(status_code=400, detail="Selected PO is not in the register.")
+    try:
+        amended = InvoiceFields.model_validate({**result["extraction"], **payload.corrections,
+                                                "po_number": payload.selected_po or payload.corrections.get("po_number") or result["extraction"].get("po_number")})
+        if amended.total_amount is not None and amended.total_amount <= 0:
+            raise ValueError("Invoice total must be positive.")
+        if amended.tax_amount is not None and amended.tax_amount < 0:
+            raise ValueError("Tax amount cannot be negative.")
+        # Validate the human-edited structure without changing the immutable machine suggestion.
+        evaluate_invoice(amended, vendors(), purchase_orders(),
+                         [p for p in previous_invoices() if p["invoice_id"] != invoice_id])
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid correction: {exc}") from exc
+    final_status = "approved" if payload.action == "approve" else "rejected"
+    add_approval_review(invoice_id, payload.action, final_status, payload.corrections,
+                        payload.selected_po or amended.po_number, payload.note,
+                        result["suggested_status"])
+    previous_corrections = result["reviews"][0]["corrections"] if result["reviews"] else {}
+    if payload.corrections or previous_corrections:
+        update_fields = {
+            "vendor_name": amended.vendor_name,
+            "invoice_number": amended.invoice_number,
+            "invoice_date": amended.invoice_date.isoformat() if amended.invoice_date else None,
+            "total_amount": as_money(amended.total_amount),
+            "tax_amount": as_money(amended.tax_amount),
+            "currency": amended.currency,
+        }
+        keys = [key for key in update_fields if key in payload.corrections or key in previous_corrections]
+        if keys:
+            with connect() as conn:
+                conn.execute(f"UPDATE invoices SET {', '.join(f'{key} = ?' for key in keys)} WHERE id = ?",
+                             [*(update_fields[key] for key in keys), invoice_id])
+            run_reconciliation_and_store()
+    return {"message": "Human approval decision saved.", "final_status": final_status}
+
+
+@app.get("/api/source-files/{source_id}")
+def original_source(source_id: str) -> Response:
+    init_db()
+    init_approval_db()
+    item = source_document(source_id)
+    if not item or item.get("content") is None:
+        raise HTTPException(status_code=404, detail="Original document is unavailable for this record.")
+    filename = Path(item["original_filename"]).name.replace('"', "")
+    media_type = "application/pdf" if filename.lower().endswith(".pdf") else "text/csv"
+    return Response(content=item["content"], media_type=media_type,
+                    headers={"Content-Disposition": f'inline; filename="{filename}"'})
+
+
+@app.get("/api/source-files/{source_id}/preview")
+def source_preview(source_id: str, page: int = 1) -> Response:
+    init_db()
+    init_approval_db()
+    item = source_document(source_id)
+    if not item or item.get("content") is None or not item["original_filename"].lower().endswith(".pdf"):
+        raise HTTPException(status_code=404, detail="PDF preview is unavailable.")
+    try:
+        with fitz.open(stream=item["content"], filetype="pdf") as pdf:
+            if page < 1 or page > pdf.page_count:
+                raise HTTPException(status_code=400, detail="Page number is outside the document.")
+            image = pdf[page - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            content = image.tobytes("png")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"PDF preview could not be rendered: {exc}") from exc
+    return Response(content=content, media_type="image/png")
+
+
+@app.get("/api/approval/export")
+def approval_export() -> StreamingResponse:
+    init_db()
+    init_approval_db()
+    buffer = io.StringIO()
+    keys = ["invoice_id", "vendor", "invoice_number", "po_number", "invoice_amount",
+            "po_amount", "difference", "tolerance", "suggested_decision",
+            "final_human_decision", "validation_warnings", "reason_for_decision", "review_notes"]
+    writer = csv.DictWriter(buffer, fieldnames=keys)
+    writer.writeheader()
+    po_lookup = {po.number: po for po in purchase_orders()}
+    for row in approval_rows():
+        detail = approval_detail(row["invoice_id"])
+        if not detail:
+            continue
+        suggestion = detail["suggestion"]
+        po = po_lookup.get(detail["selected_po"] or detail["matched_po"])
+        writer.writerow({
+            "invoice_id": row["invoice_id"], "vendor": row["vendor_name"],
+            "invoice_number": row["invoice_number"], "po_number": detail["selected_po"],
+            "invoice_amount": row["total_amount"],
+            "po_amount": as_money(po.approved_amount) if po else "",
+            "difference": suggestion.get("difference"), "tolerance": suggestion.get("tolerance"),
+            "suggested_decision": row["suggested_status"],
+            "final_human_decision": detail["reviews"][0]["final_status"] if detail["reviews"] else "",
+            "validation_warnings": "|".join(suggestion.get("reason_codes") or []),
+            "reason_for_decision": suggestion.get("explanation"),
+            "review_notes": " | ".join(review["note"] for review in detail["reviews"] if review["note"]),
+        })
+    buffer.seek(0)
+    return StreamingResponse(iter([buffer.getvalue()]), media_type="text/csv",
+                             headers={"Content-Disposition": 'attachment; filename="finguard-approval-report.csv"'})
 

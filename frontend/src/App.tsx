@@ -143,7 +143,10 @@ function SecondaryButton({
   );
 }
 
-export default function App() {
+export default function App({ embedded = false, onWorkspaceChange }: {
+  embedded?: boolean;
+  onWorkspaceChange?: () => void | Promise<void>;
+}) {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [rows, setRows] = useState<ResultRow[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -152,6 +155,7 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [invoiceFiles, setInvoiceFiles] = useState<FileList | null>(null);
   const [bankFiles, setBankFiles] = useState<FileList | null>(null);
+  const [uploadInputKey, setUploadInputKey] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -241,6 +245,8 @@ export default function App() {
       setMessage(response.message);
       const list = await refresh("", "all");
       setSelectedId(list.find((row) => row.needs_review)?.id || list[0]?.id || null);
+      setInvoiceFiles(null); setBankFiles(null); setUploadInputKey(value => value + 1);
+      await onWorkspaceChange?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sample reload failed.");
     } finally {
@@ -258,8 +264,11 @@ export default function App() {
     try {
       const response = await uploadWorkspace(formData);
       setMessage([response.message, ...(response.messages || [])].join(" "));
+      setSearch(""); setStatusFilter("all");
       const list = await refresh("", "all");
       setSelectedId(list[0]?.id || null);
+      setInvoiceFiles(null); setBankFiles(null); setUploadInputKey(value => value + 1);
+      await onWorkspaceChange?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed.");
     } finally {
@@ -301,6 +310,7 @@ export default function App() {
       setMessage("Review decision saved.");
       await refresh();
       applyDetail(await fetchDetail(detail.result.id));
+      await onWorkspaceChange?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Review save failed.");
     } finally {
@@ -321,8 +331,8 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-paper text-ink">
-      <header className="border-b border-line bg-warm/90 backdrop-blur">
+    <div className={embedded ? "bg-paper text-ink" : "min-h-screen bg-paper text-ink"}>
+      {!embedded && <header className="border-b border-line bg-warm/90 backdrop-blur">
         <div className="mx-auto flex max-w-[1440px] flex-col gap-4 px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-teal text-slate-950">
@@ -343,7 +353,7 @@ export default function App() {
             </a>
           </div>
         </div>
-      </header>
+      </header>}
 
       <main className="mx-auto grid max-w-[1440px] gap-5 px-5 py-5 xl:grid-cols-[390px_minmax(0,1fr)]">
         <aside className="space-y-5">
@@ -383,7 +393,7 @@ export default function App() {
             <div className="mt-5 flex flex-col gap-2 sm:flex-row">
               <PrimaryButton onClick={handleLoadDemo} busy={busy === "demo"}>
                 <Database className="h-4 w-4" />
-                Reload sample
+                Reload demo
               </PrimaryButton>
               <a
                 className="inline-flex min-h-10 flex-1 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold text-ink transition hover:border-slate-300"
@@ -404,6 +414,7 @@ export default function App() {
               <label className="block">
                 <span className="text-sm font-medium text-muted">Invoice PDFs</span>
                 <input
+                  key={`invoice-${uploadInputKey}`}
                   className="mt-1 block w-full rounded-md border border-line bg-white px-3 py-2 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-warm file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-ink"
                   type="file"
                   accept="application/pdf"
@@ -414,6 +425,7 @@ export default function App() {
               <label className="block">
                 <span className="text-sm font-medium text-muted">Bank CSV</span>
                 <input
+                  key={`bank-${uploadInputKey}`}
                   className="mt-1 block w-full rounded-md border border-line bg-white px-3 py-2 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-warm file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-ink"
                   type="file"
                   accept=".csv,text/csv"
@@ -832,9 +844,9 @@ export default function App() {
         </section>
       </main>
 
-      <footer className="mx-auto max-w-[1440px] px-5 pb-6 text-xs text-muted">
+      {!embedded && <footer className="mx-auto max-w-[1440px] px-5 pb-6 text-xs text-muted">
         API: {API_BASE}. FinGuard does not provide tax, legal, GST, or banking advice.
-      </footer>
+      </footer>}
     </div>
   );
 }

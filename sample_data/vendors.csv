@@ -1,0 +1,8 @@
+vendor_id,legal_name,gstin,approved,active
+V-METRO,Metro Facility Services,29METRO1234A1Z5,yes,yes
+V-KAVERI,Kaveri Paper Mart,29KAVERI123A1Z5,yes,yes
+V-PIXEL,PixelCraft Design Studio,29PIXEL1234A1Z5,yes,yes
+V-BLUE,Blue Lotus Packaging,29BLUE12345A1Z5,yes,yes
+V-CEDAR,Cedar Cleaning Care,29CEDAR1234A1Z5,yes,yes
+V-NARMADA,Narmada Office Tech,29NARMADA12A1Z5,no,yes
+V-RIVER,Riverbend Logistics,29RIVER1234A1Z5,yes,no

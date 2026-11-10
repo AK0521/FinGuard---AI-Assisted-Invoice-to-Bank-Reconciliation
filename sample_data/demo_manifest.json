@@ -1,0 +1,59 @@
+{
+  "initial_invoices": [
+    "01_metro_clean.pdf",
+    "02_kaveri_tax_discrepancy.pdf",
+    "04_blue_lotus_split_one.pdf"
+  ],
+  "invoices": [
+    {
+      "path": "01_metro_clean.pdf",
+      "title": "Clean approval",
+      "scenario": "Metro invoice MFS-908 matches its approved vendor, PO-FAC-101, amount and 18% tax. It is the reference for the later duplicate."
+    },
+    {
+      "path": "02_kaveri_tax_discrepancy.pdf",
+      "title": "Tax exception",
+      "scenario": "Kaveri invoice KPM-331 reports INR 7,000 tax on INR 35,000, while PO-STAT-201 specifies 18% (INR 6,300)."
+    },
+    {
+      "path": "03_pixelcraft_bundled.pdf",
+      "title": "Bundled service invoice",
+      "scenario": "PixelCraft invoice PCD-2026-009 uses a different PDF layout for a bundled design sprint against PO-DES-301."
+    },
+    {
+      "path": "04_blue_lotus_split_one.pdf",
+      "title": "First invoice on a shared PO",
+      "scenario": "Blue Lotus invoice BLP-9001 consumes INR 12,000 of the INR 30,000 PO-PACK-401. Later invoices use the same PO."
+    },
+    {
+      "path": "05_blue_lotus_split_two.pdf",
+      "title": "Valid second invoice on the same PO",
+      "scenario": "Blue Lotus invoice BLP-9002 consumes another INR 12,000 of PO-PACK-401, leaving INR 6,000."
+    },
+    {
+      "path": "06_blue_lotus_over_balance.pdf",
+      "title": "PO balance exception",
+      "scenario": "Blue Lotus invoice BLP-9003 requests INR 10,000 after the first two invoices, exceeding the remaining PO balance by INR 4,000."
+    },
+    {
+      "path": "07_metro_duplicate.pdf",
+      "title": "Confirmed duplicate",
+      "scenario": "Metro repeats invoice number MFS-908 from the preloaded clean invoice; the duplicate check should reject it."
+    },
+    {
+      "path": "08_cedar_scanned_missing_number.pdf",
+      "title": "Scanned invoice with missing number",
+      "scenario": "Cedar's PDF is image-only and omits the invoice number. OCR is attempted when available, and the missing field requires review."
+    },
+    {
+      "path": "live_upload/09_blue_lotus_live_upload.pdf",
+      "title": "Fresh clean upload",
+      "scenario": "Blue Lotus invoice BLP-9010 uses separate PO-PACK-402 and shows GST included in the INR 16,000 total."
+    }
+  ],
+  "bank_statement": {
+    "path": "bank_statement.csv",
+    "title": "Payment reconciliation",
+    "scenario": "Five outgoing rows: full Metro and Blue Lotus BLP-9001 payments, partial Kaveri and Blue Lotus BLP-9002 payments, and an unmatched card purchase."
+  }
+}

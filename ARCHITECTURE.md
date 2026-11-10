@@ -1,119 +1,94 @@
-# Architecture
+# FinGuard Architecture
 
-## Target User And Problem
+FinGuard is one local application with two linked workflows: **invoice-to-PO approval** and **invoice-to-bank payment reconciliation**. A single invoice record can have an approval suggestion, a later human decision, and a separate payment status. Approval never sets payment status; a matching bank transaction never sets approval status.
 
-FinGuard is for finance operators, bookkeepers, accountants, and evaluators who need to reconcile vendor invoice PDFs against outgoing bank transactions. The prototype focuses on explainable invoice-to-bank reconciliation, not payment execution, ledger posting, tax filing, or GST/legal advice.
-
-## System Diagram
+## System diagram
 
 ```mermaid
 flowchart LR
-    Human[Human analyst / evaluator] --> UI[React workspace]
-    UI --> API[FastAPI backend]
-
-    API --> Upload[PDF and CSV upload]
-    Upload --> PDF[PyMuPDF text extraction]
-    PDF --> OCR{Selectable text?}
-    OCR -- no --> EasyOCR[Optional EasyOCR scan text]
-    OCR -- yes --> Parser[Invoice parser]
-    EasyOCR --> Parser
-
-    Parser --> Missing{Missing fields?}
-    Missing -- yes --> OllamaExtract[Optional local Ollama structured extraction]
-    Missing -- no --> Records[Structured invoice records]
-    OllamaExtract --> Records
-
-    Upload --> CSV[Bank CSV parser]
-    CSV --> BankRecords[Structured bank transactions]
-
-    Records --> DB[(SQLite)]
-    BankRecords --> DB
-    DB --> Engine[Deterministic reconciliation engine]
-    Engine --> DB
-
-    DB --> Evidence[Evidence index]
-    Evidence --> RAG[Retrieval and cited Q&A]
-    RAG --> OllamaQA[Optional local Ollama answer rewrite]
-    OllamaQA --> UI
-    RAG --> UI
-
-    DB --> Detail[Evidence detail]
-    Detail --> HumanReview[Human approve / reject / correct / edit paid amount]
-    HumanReview --> DB
-    DB --> Export[CSV export]
+    H[AP analyst] --> UI[React / TypeScript workspace]
+    UI -->|PDF batch, vendor CSV, PO CSV| API[FastAPI]
+    UI -->|bank CSV| API
+    API --> ING[Ingestion + file validation]
+    ING --> DOC[PyMuPDF text extraction]
+    DOC -->|image-only| OCR[Optional local EasyOCR]
+    DOC --> EXT[Schema-bound invoice extraction]
+    OCR --> EXT
+    OLL[Optional local Ollama SLM] -.->|fill only missing fields from text| EXT
+    EXT --> NORM[Normalization + Pydantic schema]
+    NORM --> RULES[Deterministic vendor / PO / duplicate / tax / balance checks]
+    RULES --> DEC[Suggested approval decision]
+    DEC --> DB[(SQLite: source PDF, invoices, procurement, runs, events, suggestions)]
+    API --> BANK[Deterministic invoice-bank matching]
+    BANK --> DB
+    DB --> UI
+    H -->|correct fields, choose PO, approve or reject| REVIEW[Human approval review]
+    H -->|review bank evidence, correct match or paid amount| PAYREVIEW[Human payment review]
+    REVIEW --> DB
+    PAYREVIEW --> DB
+    DB --> REPORT[Approval + payment CSV exports]
+    DB --> QA[Evidence retrieval]
+    OLL -.->|optional cited wording only| QA
+    QA --> UI
 ```
 
-## Human And AI Boundaries
+**Solid arrows** are required runtime paths. **Dotted arrows** are optional local AI assistance. The deterministic engines, not the model, calculate money and decide suggested outcomes. The human owns final exception decisions.
 
-The human acts at upload, inspection, and final review. The analyst can approve, reject, correct a suggested match, select a candidate bank transaction, edit paid amount, and leave review notes. Review decisions are stored separately from the original system suggestion so the audit trail preserves both.
+## Data flow
 
-The AI acts only in bounded support roles:
+1. The API validates PDF extension, header and size; it stores the original bytes and SHA-256 hash in `source_files`. Bad PDFs become failed runs, not successful invoices.
+2. A processing run is created per PDF. The backend writes real `approval_events` with running, completed or failed states at ten stages. The React live run view polls these persisted events.
+3. PyMuPDF extracts text page by page. If the PDF has no selectable text, EasyOCR is attempted only when installed with local weights. Missing or poor OCR leaves fields null and sends the case to review.
+4. The parser extracts core fields with local rules. If needed and available, the approval pipeline calls Ollama once to propose additional fields from the raw text. Pydantic validates the structured result. Model-supplied fields trigger analyst review. Original text, extraction method, warnings and page references are preserved.
+5. The approval engine verifies the vendor master, finds a PO (exact reference first, controlled implied candidate second), checks duplicate identity and source hash, calculates remaining PO balance with `Decimal`, applies tolerance and tax/line checks, and emits **Approved**, **Needs review** or **Rejected** with reason codes and explanations.
+6. The original suggestion is stored in `approvals`. Human edits and final decisions are append-only entries in `approval_reviews`; the original extraction and suggestion remain intact. Corrections to shared invoice fields update the linked invoice record and recalculate payment suggestions without removing human payment reviews.
+7. Bank CSV imports create `bank_transactions`. The existing reconciliation engine matches invoice references, vendor text, payment date and amount, supports partial or multiple payments, and emits a **separate** payment outcome. A bank transaction with an explicit invoice reference cannot be counted against another invoice from the same vendor; shared unreferenced transactions need review.
+8. `review_decisions` hold human payment decisions. CSV reports read persisted records and final human statuses. Evidence Q&A retrieves indexed invoice and bank evidence, with optional local Ollama wording.
 
-- Optional local Ollama can fill missing invoice fields from text already extracted from the PDF.
-- Optional local Ollama can rewrite a retrieved, cited Q&A answer into clearer language.
+## Procurement logic
 
-The AI does not approve records, calculate authoritative totals, invent citations, or change final payment status. Payment status is produced by deterministic code and remains human-reviewable.
+- **Vendor:** GSTIN or normalized legal name identifies a vendor. An approximate name alone is a review case. Unapproved or inactive vendor is a hard stop.
+- **PO:** An explicit PO reference takes priority. Without it, one eligible vendor/currency/date PO can be suggested, but still requires review. Multiple candidates are shown without choosing arbitrarily. Closed or cancelled POs, or a PO belonging to another verified vendor, are hard stops.
+- **Balance:** Remaining PO amount equals approved amount minus opening invoiced value and previously **approved** invoice totals. A second invoice against the same PO is valid if within the balance. The threshold is the greater of the PO's absolute and percentage tolerances.
+- **Duplicates:** A repeated source hash or same vendor plus normalized invoice number is a confirmed duplicate and rejected. Same vendor/date/amount is a possible duplicate and needs review. A shared PO number alone is not a duplicate.
+- **Tax and lines:** Subtotal plus tax is checked against total. If available, tax is compared with the PO rate and tax treatment. Item descriptions and line arithmetic are checked; unreliable bundled comparisons stay in review. No missing value is silently invented.
+- **Decisions:** Hard stops yield Rejected. Missing, ambiguous or inconsistent evidence yields Needs review. Only a case with no material warning or hard stop can be automatically Approved.
 
-## Data Flow
+## Persistence model
 
-1. The backend initializes SQLite and auto-loads the sample workspace if the database is empty.
-2. Invoice PDFs are parsed with PyMuPDF. If a PDF has no selectable text and EasyOCR is installed, pages are rendered and OCR is attempted.
-3. The invoice parser extracts vendor, invoice number, invoice date, tax, total, currency, raw text, filename, and page number.
-4. If required fields are missing and Ollama is available, the extracted text is sent to local Ollama for strict JSON field extraction.
-5. Bank CSV files are parsed into transaction date, description, debit, credit, reference, original filename, and CSV row number.
-6. The deterministic reconciliation engine compares invoice and bank records.
-7. Results, evidence snippets, and review decisions are persisted in SQLite.
-8. The frontend displays the workspace, evidence detail, Q&A, review controls, and CSV export.
+```text
+source_files (original bytes, hash, filename)
+  └─ invoices (shared invoice identity and parsed amount)
+       ├─ approvals (immutable extraction + machine suggestion, one per processed PDF)
+       │    ├─ approval_runs → approval_events
+       │    └─ approval_reviews (append-only human corrections and final decision)
+       └─ reconciliation_results (separate payment suggestion)
+            └─ review_decisions (append-only human payment decision)
+vendors ── purchase_orders ── approvals.matched_po
+bank_transactions ── reconciliation_results
+evidence_index (retrieval snippets)
+```
 
-## Deterministic Reconciliation
+SQLite is local and ignored by Git. The demo CSVs/PDFs and scenario manifest are included in `sample_data`. On a fresh empty database, only three selected PDFs are processed through the same backend path as user documents; vendor and PO reference data load, while the remaining PDFs and bank CSV wait for manual upload. **Reload demo** explicitly clears and reconstructs that three-invoice, no-bank state; normal uploads append. An exact repeat of an already imported bank CSV is skipped by its SHA-256 fingerprint.
 
-The reconciliation engine determines suggested status and amounts using:
+## Failure and uncertainty handling
 
-- invoice number and payment reference overlap,
-- vendor token overlap,
-- payment date window,
-- exact amount, partial amount, near mismatch, overpayment, or mismatch logic,
-- duplicate or ambiguous candidate detection.
+- Invalid PDF: failed run and visible error; no fabricated invoice.
+- No OCR: an invoice record with missing fields and warnings; Needs review.
+- Invalid or unavailable Ollama response: rule-based extraction continues; the UI does not claim model use.
+- Ambiguous vendor, PO or payment: Needs review with candidates.
+- Duplicate or invalid vendor/PO: hard-stop rejection.
+- Finance arithmetic: `Decimal`, source values retained, differences and tolerance shown.
+- Review: original system recommendation and human final decision are separate records.
 
-Statuses include:
+## Alternatives considered
 
-- `matched`
-- `partially_paid`
-- `unpaid`
-- `needs_review`
-- `unmatched_bank`
+- **Pure LLM approval:** rejected because financial arithmetic and policy need reproducible, testable rules.
+- **Vector database / agents / microservices:** rejected for this local prototype; the evidence volume is small and SQLite retrieval is sufficient.
+- **Auto-selecting a fuzzy vendor, PO or bank payment:** rejected because a plausible but wrong match can create a false approval or double count a payment.
+- **Precomputed dashboard statuses:** rejected; sample PDFs run through the parser and rules, with real persisted events.
+- **Cloud OCR or paid LLM:** rejected as required dependencies for a reproducible local evaluation.
 
-Ambiguous candidates, duplicate-looking candidates, missing invoice numbers, and amount mismatches are marked for review rather than silently resolved.
+## Before production
 
-## Retrieval And RAG Boundary
-
-The evidence index stores invoice text, bank transaction text, and local workspace policy snippets in SQLite. Evidence Q&A retrieves relevant records first. If Ollama is available, it rewrites the grounded answer while using only the retrieved evidence and deterministic answer. Citations include invoice page numbers or bank CSV row numbers.
-
-Structured totals and payment statuses come from SQLite and the reconciliation engine, not from a generative answer.
-
-## Technology Choices
-
-- React, TypeScript, Vite, Tailwind, and lucide-react provide a responsive analyst workspace.
-- FastAPI and Pydantic provide a small typed API surface.
-- SQLite keeps the prototype easy to run locally and inspect.
-- PyMuPDF handles normal text-based invoice PDFs.
-- EasyOCR is optional for scanned invoice PDFs.
-- Ollama is optional and avoids cloud LLM API keys.
-- Pytest covers parsing, reconciliation, review persistence, Q&A citations, and export.
-
-## Alternatives Rejected
-
-- Pure LLM reconciliation was rejected because payment status and amounts need deterministic, inspectable logic.
-- A vector database was rejected because the prototype workspace is small and keyword retrieval is sufficient.
-- PostgreSQL, Docker, and cloud deployment were rejected to keep the public submission easy to run locally.
-- Fully automated approval was rejected because finance workflows need human accountability.
-- External LLM APIs were avoided to reduce confidential-data exposure.
-
-## Main Limitations
-
-- One active local workspace, not multi-user workspace history.
-- CSV bank upload only; scanned bank statement PDF parsing is not implemented.
-- OCR is optional and depends on local EasyOCR quality.
-- Vendor matching is conservative and can miss uncommon abbreviations.
-- Review decisions do not post to an accounting ledger.
-- This prototype does not provide tax, GST, legal, or banking advice.
+Validate extraction on a representative, permissioned invoice corpus; measure false approvals, duplicate misses and OCR failure rates. Integrate an authoritative ERP/vendor master and formal PO policy. Add authentication, tenant isolation, access control, encryption, retention, backups, durable job queue, migrations, monitoring and human-review SLAs. Get tax and legal review of policy rules. Do not use this prototype to execute payments.

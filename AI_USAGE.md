@@ -1,28 +1,20 @@
-# AI Usage
+# AI Use and Decision Boundaries
 
-This project uses AI in two different ways: AI-assisted development during the build process, and optional local AI inside the running application.
+FinGuard uses local AI only where text interpretation benefits from it. The application remains usable without a model.
 
-## AI During Development
+## Where Ollama can act
 
-AI assistance was used to help plan the product flow, draft code, refine the UI, write documentation, and identify edge cases. All critical product behavior was verified with local tests and manual API checks before being treated as working.
+- **Invoice extraction:** PyMuPDF or EasyOCR first produces source text. The rule-based parser extracts common fields. If key fields are missing and a configured local Ollama model is available, the approval pipeline asks it for a JSON object containing only fields supported by the text. A Pydantic schema validates the result; invalid or missing values remain empty. The run records `text+ollama` or `ocr+ollama` only when a model response was actually used. Any case with model-supplied fields is flagged for source review.
+- **Evidence Q&A:** The existing evidence index retrieves invoice and bank records. A deterministic answer is built from those records. Ollama can optionally rewrite that cited answer without introducing new facts. The UI labels the answer mode.
 
-Important non-AI design decisions included:
+The default model is `qwen2.5-coder:1.5b` at a local Ollama endpoint. Availability is checked at runtime. `FINGUARD_DISABLE_OLLAMA=1` forces deterministic fallback.
 
-- keeping reconciliation status deterministic rather than LLM-decided,
-- preserving human review and audit trail,
-- running without cloud LLM credentials,
-- including a default sample workspace for evaluators,
-- keeping uploaded workspaces local in SQLite.
+## Where AI does not act
 
-## AI Inside FinGuard
+- Vendor eligibility, PO status and balance, tolerance, tax and line arithmetic, duplicate classification, suggested approval status, bank matching, paid amount and outstanding balance are calculated by Python rules using `Decimal`.
+- AI never posts a human review, marks an invoice paid, executes a payment or changes a PO.
+- OCR is document text recognition, not a finance decision. If OCR or SLM extraction is uncertain, the invoice is routed to review with visible warnings.
 
-FinGuard does not require a cloud LLM API key. If local Ollama is available, the app uses it only for bounded assistance:
+## Why the architecture matters
 
-- extracting missing invoice fields from text already extracted from a PDF,
-- rewriting retrieved Evidence Q&A answers into clearer language.
-
-The LLM is not allowed to approve records, create citations, calculate authoritative totals, or change final review decisions.
-
-## Verification
-
-The backend test suite covers parsing, reconciliation behavior, review persistence, cited Q&A behavior, and CSV export. The frontend production build was also run before submission-readiness review.
+A fluent answer can be wrong. FinGuard stores raw source text, the original PDF, extraction method, page references, validation checks, reason codes and an immutable system suggestion. A human can inspect and correct a record; the correction and final decision are stored separately. This makes model assistance useful without allowing it to silently determine a financial outcome.

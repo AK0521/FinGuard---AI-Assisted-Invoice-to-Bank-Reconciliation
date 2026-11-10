@@ -129,6 +129,11 @@ def _reason_text(codes: list[str]) -> str:
             "This record needs review because another invoice has the same invoice number and amount, so the "
             "bank payment cannot be assigned safely without analyst confirmation."
         )
+    if "ambiguous_invoice_assignment" in code_set:
+        return (
+            "This bank transaction could belong to more than one invoice. It has not been assigned or counted "
+            "as paid until an analyst selects the correct invoice."
+        )
     if "ambiguous_candidates" in code_set:
         return (
             "This record needs review because more than one plausible bank transaction was found. An analyst "
@@ -186,6 +191,7 @@ def reconcile_records(
 ) -> list[ReconciliationSuggestion]:
     duplicate_keys = Counter(
         (
+            normalize_reference(inv.vendor_name),
             normalize_invoice_number(inv.invoice_number),
             str(inv.total_amount or ""),
         )
@@ -196,6 +202,24 @@ def reconcile_records(
     results: list[ReconciliationSuggestion] = []
     all_candidate_tx_ids: set[str] = set()
     selected_tx_ids: set[str] = set()
+    known_numbers = {normalize_invoice_number(inv.invoice_number) for inv in invoices if inv.invoice_number}
+    candidate_map: dict[str, list[MatchCandidate]] = {}
+    tx_claims: dict[str, set[str]] = {}
+    for invoice in invoices:
+        invoice_no = normalize_invoice_number(invoice.invoice_number)
+        eligible: list[MatchCandidate] = []
+        for tx in bank_transactions:
+            bank_text = normalize_reference(f"{tx.description} {tx.reference or ''}")
+            mentioned = {number for number in known_numbers if number in bank_text}
+            # An explicit reference to another invoice outranks a vendor-only match.
+            if mentioned and invoice_no not in mentioned:
+                continue
+            candidate = _candidate_for(invoice, tx, window_days)
+            if candidate is not None:
+                eligible.append(candidate)
+                tx_claims.setdefault(tx.id, set()).add(invoice.id)
+        candidate_map[invoice.id] = sorted(eligible, key=lambda item: item.score, reverse=True)
+    shared_transactions = {tx_id for tx_id, claims in tx_claims.items() if len(claims) > 1}
 
     for invoice in invoices:
         missing = []
@@ -206,15 +230,10 @@ def reconcile_records(
         if invoice.total_amount is None:
             missing.append("total_amount")
 
-        duplicate_key = (normalize_invoice_number(invoice.invoice_number), str(invoice.total_amount or ""))
+        duplicate_key = (normalize_reference(invoice.vendor_name), normalize_invoice_number(invoice.invoice_number), str(invoice.total_amount or ""))
         has_duplicate_invoice = bool(duplicate_key[0] and duplicate_keys[duplicate_key] > 1)
 
-        candidates = [
-            candidate
-            for tx in bank_transactions
-            if (candidate := _candidate_for(invoice, tx, window_days)) is not None
-        ]
-        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        candidates = candidate_map[invoice.id]
         candidate_ids = [candidate.transaction_id for candidate in candidates]
         all_candidate_tx_ids.update(candidate_ids)
 
@@ -281,6 +300,18 @@ def reconcile_records(
                     reason_text=_reason_text(codes),
                     confidence=Decimal("0.50"),
                     needs_review=True,
+                )
+            )
+            continue
+
+        if any(candidate.transaction_id in shared_transactions for candidate in candidates):
+            codes = ["ambiguous_invoice_assignment", *candidates[0].reason_codes]
+            results.append(
+                ReconciliationSuggestion(
+                    id=f"rec_{invoice.id}", invoice_id=invoice.id, outcome="needs_review",
+                    outstanding_amount=invoice.total_amount or Decimal("0.00"),
+                    candidate_transaction_ids=candidate_ids, reason_codes=codes,
+                    reason_text=_reason_text(codes), confidence=Decimal("0.40"), needs_review=True,
                 )
             )
             continue

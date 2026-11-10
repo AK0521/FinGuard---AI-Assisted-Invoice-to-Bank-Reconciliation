@@ -5,11 +5,11 @@ import io
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
+from functools import lru_cache
 
 import fitz
 
 from .database import new_id
-from .llm import extract_invoice_fields_with_ollama
 from .models import BankTransactionRecord, InvoiceRecord
 from .normalization import money, parse_date
 
@@ -19,6 +19,7 @@ class ParseReport:
     invoices: list[InvoiceRecord] = field(default_factory=list)
     transactions: list[BankTransactionRecord] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    page_texts: list[tuple[int, str]] = field(default_factory=list)
 
 
 def _first_match(patterns: list[str], text: str) -> str | None:
@@ -72,14 +73,26 @@ def _extract_vendor(text: str) -> str | None:
         "ocr testing",
         "image-only pdf",
     ]
-    for line in _split_invoice_markers(text).splitlines():
+    lines = _split_invoice_markers(text).splitlines()
+    for index, line in enumerate(lines):
         candidate = re.sub(r"\s+", " ", line.strip(" :-\t"))
         if len(candidate) < 3:
             continue
         lowered = candidate.lower()
-        if any(marker in lowered for marker in skip_markers):
+        if any(re.match(rf"^{re.escape(marker)}(?:\b|\s*:)", lowered) for marker in skip_markers):
             continue
         if re.search(r"[A-Za-z]", candidate):
+            sentence_vendor = re.match(r"(?i)^(.{3,80}?)\s+issued\s+(?:bill|invoice)\b", candidate)
+            if sentence_vendor and not re.search(r"\d", sentence_vendor.group(1)):
+                return sentence_vendor.group(1).strip()
+            if re.search(r"(?i)\b(?:issued|dated|purchase\s+order|INR\s*\d)\b", candidate):
+                continue
+            # OCR may split a short vendor heading across two lines.
+            if index == 0 and len(candidate) < 20 and len(lines) > 1:
+                next_line = lines[1].strip()
+                if (next_line and len(next_line) < 30 and not re.search(r"[0-9,:|@]", next_line)
+                        and not re.match(r"(?i)^(tax\s+)?invoice\b", next_line)):
+                    return f"{candidate} {next_line}"[:120]
             return candidate[:120]
     return None
 
@@ -112,9 +125,9 @@ def parse_invoice_pdf(contents: bytes, filename: str, source_file_id: str) -> Pa
             page_texts.append((index, text))
 
     if not page_texts:
-        ocr_text = _ocr_pdf_text(doc)
-        if ocr_text:
-            page_texts = [(1, ocr_text)]
+        ocr_pages = _ocr_pdf_text(doc)
+        if ocr_pages:
+            page_texts = ocr_pages
             report.messages.append(f"{filename}: text was extracted with local OCR because selectable PDF text was absent.")
         else:
             report.messages.append(
@@ -122,13 +135,14 @@ def parse_invoice_pdf(contents: bytes, filename: str, source_file_id: str) -> Pa
             )
             return report
 
+    report.page_texts = page_texts
     full_text = "\n".join(text for _, text in page_texts)
     first_page = page_texts[0][0]
     vendor = _extract_vendor(full_text)
     invoice_number = _first_match(
         [
             r"(?:Invoice\s*(?:Number|No\.?|#)|Inv\s*No\.?)\s*[:\-]\s*([A-Z0-9][A-Z0-9\-\/]+)",
-            r"\b(INV[-\/]?[A-Z0-9\-\/]+)\b",
+            r"\b(INV[-\/]?(?=[A-Z0-9\-\/]*\d)[A-Z0-9\-\/]+)\b",
         ],
         full_text,
     )
@@ -148,15 +162,6 @@ def parse_invoice_pdf(contents: bytes, filename: str, source_file_id: str) -> Pa
         full_text,
     )
     currency = _first_match([r"(?:Currency)\s*[:\-]\s*([A-Z]{3})"], full_text) or "INR"
-
-    if not all([vendor, invoice_number, invoice_date_raw, total_raw]):
-        llm_fields = extract_invoice_fields_with_ollama(full_text)
-        vendor = vendor or llm_fields.get("vendor_name")
-        invoice_number = invoice_number or llm_fields.get("invoice_number")
-        invoice_date_raw = invoice_date_raw or llm_fields.get("invoice_date")
-        total_raw = total_raw or llm_fields.get("total_amount")
-        tax_raw = tax_raw or llm_fields.get("tax_amount")
-        currency = currency or llm_fields.get("currency") or "INR"
 
     flags: list[str] = []
     invoice_date = parse_date(invoice_date_raw)
@@ -190,29 +195,33 @@ def parse_invoice_pdf(contents: bytes, filename: str, source_file_id: str) -> Pa
     return report
 
 
-def _ocr_pdf_text(doc: fitz.Document) -> str:
+@lru_cache(maxsize=1)
+def _easyocr_reader():
+    import easyocr
+
+    return easyocr.Reader(["en"], gpu=False, verbose=False, download_enabled=False)
+
+
+def _ocr_pdf_text(doc: fitz.Document) -> list[tuple[int, str]]:
     try:
-        import easyocr
         import numpy as np
         from PIL import Image
+        reader = _easyocr_reader()
     except Exception:
-        return ""
+        return []
 
-    try:
-        reader = easyocr.Reader(["en"], gpu=False, verbose=False)
-    except Exception:
-        return ""
-
-    chunks: list[str] = []
-    for page in doc:
+    pages: list[tuple[int, str]] = []
+    for index, page in enumerate(doc, start=1):
         try:
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
             image = Image.open(io.BytesIO(pix.tobytes("png")))
             results = reader.readtext(np.array(image), detail=0, paragraph=False)
         except Exception:
             continue
-        chunks.extend(str(item) for item in results if str(item).strip())
-    return "\n".join(chunks).strip()
+        text = "\n".join(str(item) for item in results if str(item).strip()).strip()
+        if text:
+            pages.append((index, text))
+    return pages
 
 
 def _pick(row: dict[str, str], aliases: list[str]) -> str | None:

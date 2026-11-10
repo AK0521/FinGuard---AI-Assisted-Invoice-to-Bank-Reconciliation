@@ -119,3 +119,21 @@ def test_ambiguous_candidate_match() -> None:
     assert "ambiguous_candidates" in result.reason_codes
     assert len(result.candidate_transaction_ids) == 2
 
+
+def test_explicit_reference_cannot_pay_another_invoice_from_same_vendor() -> None:
+    invoices = [inv("1", number="BLP-9001", vendor="Blue Lotus Packaging", amount="12000.00"),
+                inv("2", number="BLP-9002", vendor="Blue Lotus Packaging", amount="12000.00")]
+    bank = [tx("1", description="NEFT Blue Lotus Packaging BLP-9001", amount="12000.00")]
+    results = {result.invoice_id: result for result in reconcile_records(invoices, bank) if result.invoice_id}
+    assert results["inv_1"].outcome == "matched"
+    assert results["inv_2"].outcome == "unpaid"
+
+
+def test_vendor_only_payment_shared_between_invoices_needs_review() -> None:
+    invoices = [inv("1", number="BLP-9001", vendor="Blue Lotus Packaging", amount="12000.00"),
+                inv("2", number="BLP-9002", vendor="Blue Lotus Packaging", amount="12000.00")]
+    bank = [tx("1", description="NEFT Blue Lotus Packaging", amount="12000.00")]
+    results = [result for result in reconcile_records(invoices, bank) if result.invoice_id]
+    assert all(result.outcome == "needs_review" for result in results)
+    assert all(result.matched_amount == Decimal("0.00") for result in results)
+
